@@ -1,0 +1,60 @@
+name: Linux-ARM-Test-Lab
+
+on: 
+  workflow_dispatch: # Allows you to start it manually
+
+jobs:
+  build:
+    # Public repos get 4 vCPU / 16GB RAM on this label
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 3600 # Runner stays alive for up to 6 hours
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Auto-Setup GUI and RDP
+        run: |
+          sudo apt-get update
+          # Install XFCE (Fast & Lightweight) and XRDP
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp
+          # Set XFCE as the default session
+          echo "xfce4-session" > ~/.xsession
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+          # Fix for Ubuntu internal permissions
+          sudo adduser xrdp ssl-cert
+
+      - name: Create Test User
+        run: |
+          # Generate a random password for security
+          UPASS=$(openssl rand -base64 12)
+          sudo useradd -m -s /bin/bash tester
+          echo "tester:$UPASS" | sudo chpasswd
+          sudo usermod -aG sudo tester
+          echo "USER_PASS=$UPASS" >> $GITHUB_ENV
+
+      - name: Connect Tailscale
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ env.TS_KEY }} --hostname=gh-linux-arm
+          # Find the Tailscale IP
+          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+
+      - name: Display Connection Info
+        run: |
+          echo "--------------------------------------------------"
+          echo "SERVER READY!"
+          echo "Tailscale IP: ${{ env.TS_IP }}"
+          echo "Username:     tester"
+          echo "Password:     ${{ env.USER_PASS }}"
+          echo "--------------------------------------------------"
+          echo "Use any RDP client (like Windows Remote Desktop) to connect."
+          
+          # Keeps the session alive
+          while true; do
+            echo "Keep-alive: $(date)"
+            sleep 300
+          done
