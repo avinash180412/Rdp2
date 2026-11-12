@@ -1,4 +1,3 @@
-
 name: Ubuntu Tailscale SSH
 
 on:
@@ -21,37 +20,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ -n "${SSH_PUBLIC_KEY:-}" ]]
-          [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]
+          [[ -n "${SSH_PUBLIC_KEY:-}" ]] || { echo "::error::Missing SSH_PUBLIC_KEY secret"; exit 1; }
+          [[ -n "${TAILSCALE_AUTH_KEY:-}" ]] || { echo "::error::Missing TAILSCALE_AUTH_KEY secret"; exit 1; }
           printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh_authorized_key.pub"
-          ssh-keygen -lf "$RUNNER_TEMP/ssh_authorized_key.pub"
+          ssh-keygen -lf "$RUNNER_TEMP/ssh_authorized_key.pub" >/dev/null
+          echo "SSH public key format: valid"
 
       - name: Install OpenSSH, Python and tools
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             openssh-server \
             python3 python3-pip python3-venv python3-dev \
             build-essential \
             git curl wget jq unzip zip tmux htop \
             net-tools dnsutils ca-certificates
-
           sudo ssh-keygen -A
+          # Keep sshd stopped until Tailscale is connected and its IP is known.
           sudo systemctl stop ssh || true
           sudo systemctl disable ssh || true
 
-      - name: Create SSH account and Python environment
+      - name: Create restricted SSH account and Python environment
         shell: bash
         run: |
           set -euo pipefail
 
           sudo useradd --create-home --shell /bin/bash remote
           sudo install -d -m 700 -o remote -g remote /home/remote/.ssh
-          sudo install -o remote -g remote -m 600 /dev/null \
-            /home/remote/.ssh/authorized_keys
-
+          sudo install -o remote -g remote -m 600 /dev/null /home/remote/.ssh/authorized_keys
           while IFS= read -r key || [[ -n "$key" ]]; do
             [[ -z "$key" ]] && continue
             printf 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' "$key" \
@@ -59,25 +57,18 @@ jobs:
           done < "$RUNNER_TEMP/ssh_authorized_key.pub"
 
           sudo -u remote -H python3 -m venv /home/remote/venv
-
-          sudo -u remote -H /home/remote/venv/bin/python \
-            -m pip install --upgrade pip wheel setuptools
-
-          sudo -u remote -H /home/remote/venv/bin/python \
-            -m pip install requests httpx rich psutil python-dotenv ipython
+          sudo -u remote -H /home/remote/venv/bin/python -m pip install --upgrade pip wheel setuptools
+          sudo -u remote -H /home/remote/venv/bin/python -m pip install \
+            requests httpx rich psutil python-dotenv ipython
 
           sudo -u remote -H mkdir -p /home/remote/workspace
+          sudo -u remote -H bash -c 'printf "\n# Activate the preinstalled Python environment\n[ -f \"$HOME/venv/bin/activate\" ] && source \"$HOME/venv/bin/activate\"\n" >> "$HOME/.bashrc"'
 
-          sudo -u remote -H bash -c \
-            'echo "source ~/venv/bin/activate" >> ~/.bashrc'
-
-      - name: Configure SSH
+      - name: Configure key-only SSH
         shell: bash
         run: |
           set -euo pipefail
-
           sudo install -d -m 755 /etc/ssh/sshd_config.d
-
           sudo tee /etc/ssh/sshd_config.d/99-tailscale-ssh.conf >/dev/null <<'EOF'
           PubkeyAuthentication yes
           PasswordAuthentication no
@@ -97,51 +88,60 @@ jobs:
           ClientAliveCountMax 3
           EOF
 
+          # OpenSSH privilege-separation runtime directory is not always pre-created on runners.
+          sudo install -d -o root -g root -m 755 /run/sshd
+
+          # Validate syntax now; sshd is started only after Tailscale is ready.
           sudo /usr/sbin/sshd -t
 
-      - name: Connect Tailscale
+      - name: Connect this runner to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
           hostname: gh-ubuntu-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Start SSH on Tailscale IP
+      - name: Start SSH bound only to the Tailscale interface address
         id: connection
         shell: bash
         run: |
           set -euo pipefail
 
           TS_IP="$(tailscale ip -4 | head -n 1)"
+          [[ "$TS_IP" =~ ^100\. ]] || { echo "::error::Could not obtain a Tailscale IPv4 address"; exit 1; }
 
-          [[ "$TS_IP" =~ ^100\. ]] || exit 1
+          # Re-create the runtime directory defensively before starting sshd.
+          sudo install -d -o root -g root -m 755 /run/sshd
 
-          echo "ListenAddress $TS_IP" | sudo tee -a \
-            /etc/ssh/sshd_config.d/99-tailscale-ssh.conf
-
+          # Bind sshd to the Tailscale IPv4 only; it will not listen on public interfaces.
+          echo "ListenAddress $TS_IP" | sudo tee -a /etc/ssh/sshd_config.d/99-tailscale-ssh.conf >/dev/null
           sudo /usr/sbin/sshd -t
           sudo systemctl enable --now ssh
           sudo systemctl restart ssh
+          sudo systemctl --no-pager --full status ssh
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "### SSH access is ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Host: \`$TS_IP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Port: \`22\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- User: \`remote\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Authentication: SSH public key only" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Python environment: \`/home/remote/venv\`" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "### SSH ACCESS" >> "$GITHUB_STEP_SUMMARY"
-          echo "- IP: $TS_IP" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Port: 22" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Username: remote" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Tailscale IP: $TS_IP"
-          echo "SSH command:"
+          echo "Tailscale IPv4: $TS_IP"
+          echo "Connect from Termux or your laptop with:"
           echo "ssh -i ~/.ssh/id_ed25519 remote@$TS_IP"
-
-          sudo ss -lntp | grep -F "$TS_IP:22"
+          echo
+          echo "SSH listener:"
+          sudo ss -lntp | grep -F "$TS_IP:22" || { echo "::error::SSH is not listening on the Tailscale IP"; exit 1; }
+          echo
           tailscale status
 
-      - name: Keep SSH available
+      - name: Keep the temporary SSH environment available
         shell: bash
         run: |
           set -euo pipefail
-
+          echo "SSH remains available while this GitHub Actions job is running."
           while true; do
-            echo "[$(date -Is)] SSH active: remote@$TAILSCALE_IP"
+            echo "[$(date -Is)] SSH: remote@${TAILSCALE_IP}:22"
             sleep 300
           done
