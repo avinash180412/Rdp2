@@ -1,4 +1,4 @@
-name: Ubuntu Tailscale SSH
+name: Ubuntu Tailscale SSH - Root Access and Python Environment
 
 on:
   workflow_dispatch:
@@ -6,80 +6,184 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ubuntu-tailscale-ssh
+  cancel-in-progress: true
+
 jobs:
   ubuntu-ssh:
-    name: Temporary Ubuntu 24.04 SSH environment
+    name: Ubuntu 24.04 x64 - SSH with passwordless sudo
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Validate required secrets
+      - name: Validate required GitHub secrets and SSH public key
+        shell: bash
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        shell: bash
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
         run: |
           set -euo pipefail
-          [[ -n "${SSH_PUBLIC_KEY:-}" ]] || { echo "::error::Missing SSH_PUBLIC_KEY secret"; exit 1; }
-          [[ -n "${TAILSCALE_AUTH_KEY:-}" ]] || { echo "::error::Missing TAILSCALE_AUTH_KEY secret"; exit 1; }
-          printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh_authorized_key.pub"
-          ssh-keygen -lf "$RUNNER_TEMP/ssh_authorized_key.pub" >/dev/null
-          echo "SSH public key format: valid"
 
-      - name: Install OpenSSH, Python and tools
+          for secret_name in SSH_PUBLIC_KEY TS_OAUTH_CLIENT_ID TS_OAUTH_SECRET; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "Missing required repository secret: ${secret_name}" >&2
+              exit 1
+            fi
+          done
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" | tr -d '\r' > "$RUNNER_TEMP/ssh_authorized_keys"
+          test -s "$RUNNER_TEMP/ssh_authorized_keys"
+          ssh-keygen -lf "$RUNNER_TEMP/ssh_authorized_keys"
+          echo "Required secrets and SSH public key are present."
+
+      - name: Install OpenSSH, Python, FFmpeg and system tools
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             openssh-server \
             python3 python3-pip python3-venv python3-dev \
-            build-essential \
+            build-essential pkg-config libssl-dev libffi-dev zlib1g-dev \
+            ffmpeg \
             git curl wget jq unzip zip tmux htop \
-            net-tools dnsutils ca-certificates
-          sudo ssh-keygen -A
-          # Keep sshd stopped until Tailscale is connected and its IP is known.
-          sudo systemctl stop ssh || true
-          sudo systemctl disable ssh || true
+            net-tools dnsutils ca-certificates openssl
 
-      - name: Create restricted SSH account and Python environment
+          python3 --version
+          python3 -m pip --version || true
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Create remote account and configure passwordless root access
         shell: bash
         run: |
           set -euo pipefail
 
-          sudo useradd --create-home --shell /bin/bash remote
-          sudo install -d -m 700 -o remote -g remote /home/remote/.ssh
-          sudo install -o remote -g remote -m 600 /dev/null /home/remote/.ssh/authorized_keys
+          if ! id remote >/dev/null 2>&1; then
+            sudo useradd --create-home --shell /bin/bash remote
+          fi
+
+          # Set a random, undisclosed password so PAM does not treat the account as locked.
+          # SSH password authentication is disabled below; the supplied SSH key is required.
+          temporary_password="$(openssl rand -hex 32)"
+          password_hash="$(printf '%s' "$temporary_password" | openssl passwd -6 -stdin)"
+          sudo usermod --password "$password_hash" remote
+          unset temporary_password password_hash
+
+          sudo usermod --append --groups sudo remote
+
+          # This sudoers rule gives only the SSH account 'remote' passwordless sudo.
+          # Root SSH login remains disabled; connect as remote and run: sudo -i
+          printf '%s\n' 'remote ALL=(ALL:ALL) NOPASSWD: ALL' \
+            | sudo tee /etc/sudoers.d/90-remote >/dev/null
+          sudo chown root:root /etc/sudoers.d/90-remote
+          sudo chmod 0440 /etc/sudoers.d/90-remote
+
+          # Validate the complete sudoers configuration before opening SSH.
+          sudo visudo -cf /etc/sudoers
+
+          # Prove that 'remote' can become root without an interactive password.
+          root_uid="$(sudo -u remote -H sudo -n -- /usr/bin/id -u)"
+          if [[ "$root_uid" != "0" ]]; then
+            echo "Passwordless root verification failed; expected UID 0, got: $root_uid" >&2
+            exit 1
+          fi
+
+          sudo install -d -o remote -g remote -m 0700 /home/remote/.ssh
+          sudo install -o remote -g remote -m 0600 /dev/null \
+            /home/remote/.ssh/authorized_keys
+
           while IFS= read -r key || [[ -n "$key" ]]; do
             [[ -z "$key" ]] && continue
-            printf 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' "$key" \
+            printf '%s\n' "$key" \
               | sudo tee -a /home/remote/.ssh/authorized_keys >/dev/null
-          done < "$RUNNER_TEMP/ssh_authorized_key.pub"
+          done < "$RUNNER_TEMP/ssh_authorized_keys"
 
-          sudo -u remote -H python3 -m venv /home/remote/venv
-          sudo -u remote -H /home/remote/venv/bin/python -m pip install --upgrade pip wheel setuptools
-          sudo -u remote -H /home/remote/venv/bin/python -m pip install \
-            requests httpx rich psutil python-dotenv ipython
+          sudo chown remote:remote /home/remote/.ssh/authorized_keys
+          sudo chmod 0600 /home/remote/.ssh/authorized_keys
 
-          sudo -u remote -H mkdir -p /home/remote/workspace
-          sudo -u remote -H bash -c 'printf "\n# Activate the preinstalled Python environment\n[ -f \"$HOME/venv/bin/activate\" ] && source \"$HOME/venv/bin/activate\"\n" >> "$HOME/.bashrc"'
+          echo "PASS: remote can run sudo without a password (root UID ${root_uid})."
 
-      - name: Configure key-only SSH
+      - name: Create Python virtual environment and install pinned requirements
         shell: bash
         run: |
           set -euo pipefail
-          sudo install -d -m 755 /etc/ssh/sshd_config.d
-          sudo tee /etc/ssh/sshd_config.d/99-tailscale-ssh.conf >/dev/null <<'EOF'
+
+          sudo install -d -o remote -g remote -m 0755 /home/remote/workspace
+
+          sudo tee /home/remote/workspace/requirements.txt >/dev/null <<'EOF'
+          telethon==1.44.0
+          cryptg==0.5.2
+          python-socks[asyncio]==2.8.2
+          httpx==0.27.2
+          aiosqlite==0.20.0
+          python-dotenv==1.0.1
+          yt-dlp==2024.12.13
+          EOF
+          sudo chown remote:remote /home/remote/workspace/requirements.txt
+          sudo chmod 0644 /home/remote/workspace/requirements.txt
+
+          sudo -u remote -H python3 -m venv /home/remote/workspace/.venv
+          sudo -u remote -H /home/remote/workspace/.venv/bin/python \
+            -m pip install --upgrade pip setuptools wheel
+          sudo -u remote -H /home/remote/workspace/.venv/bin/python \
+            -m pip install --no-cache-dir -r /home/remote/workspace/requirements.txt
+          sudo -u remote -H /home/remote/workspace/.venv/bin/python -m pip check
+
+          # Activate the venv automatically for interactive SSH Bash sessions.
+          sudo touch /home/remote/.bashrc
+          if ! sudo grep -q 'RSHELLAB_VENV_AUTOACTIVATE' /home/remote/.bashrc; then
+            sudo tee -a /home/remote/.bashrc >/dev/null <<'EOF'
+          # RSHELLAB_VENV_AUTOACTIVATE
+          if [[ $- == *i* && -f "$HOME/workspace/.venv/bin/activate" ]]; then
+            source "$HOME/workspace/.venv/bin/activate"
+          fi
+          EOF
+          fi
+          sudo chown remote:remote /home/remote/.bashrc
+
+          # Import checks ensure the requested packages installed successfully.
+          sudo -u remote -H /home/remote/workspace/.venv/bin/python - <<'PY'
+          import aiosqlite
+          import cryptg
+          import httpx
+          import telethon
+          import yt_dlp
+          import python_socks
+          from dotenv import load_dotenv
+          from yt_dlp.version import __version__ as ytdlp_version
+
+          print("Telethon:", telethon.__version__)
+          print("cryptg: import OK")
+          print("python-socks: import OK")
+          print("httpx:", httpx.__version__)
+          print("aiosqlite:", aiosqlite.__version__)
+          print("python-dotenv: import OK")
+          print("yt-dlp:", ytdlp_version)
+          PY
+
+      - name: Configure key-only SSH daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d
+          sudo install -d -o root -g root -m 0755 /run/sshd
+
+          sudo tee /etc/ssh/sshd_config.d/99-remote-tailscale.conf >/dev/null <<'EOF'
           PubkeyAuthentication yes
           PasswordAuthentication no
           KbdInteractiveAuthentication no
-          PermitRootLogin no
-          PermitEmptyPasswords no
           AuthenticationMethods publickey
+          PermitRootLogin no
           AllowUsers remote
+          PermitEmptyPasswords no
           X11Forwarding no
           AllowAgentForwarding no
-          AllowTcpForwarding no
+          AllowTcpForwarding yes
           PermitTunnel no
           GatewayPorts no
           MaxAuthTries 3
@@ -88,60 +192,92 @@ jobs:
           ClientAliveCountMax 3
           EOF
 
-          # OpenSSH privilege-separation runtime directory is not always pre-created on runners.
-          sudo install -d -o root -g root -m 755 /run/sshd
-
-          # Validate syntax now; sshd is started only after Tailscale is ready.
           sudo /usr/sbin/sshd -t
+          echo "SSH configuration syntax validated."
 
-      - name: Connect this runner to Tailscale
+      - name: Connect ephemeral runner to Tailscale
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          hostname: gh-ubuntu-${{ github.run_id }}-${{ github.run_attempt }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
 
-      - name: Start SSH bound only to the Tailscale interface address
-        id: connection
+      - name: Bind SSH to Tailscale and verify root access
+        id: ssh
         shell: bash
         run: |
           set -euo pipefail
 
-          TS_IP="$(tailscale ip -4 | head -n 1)"
-          [[ "$TS_IP" =~ ^100\. ]] || { echo "::error::Could not obtain a Tailscale IPv4 address"; exit 1; }
+          ts_ip=""
+          for attempt in $(seq 1 20); do
+            ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+            if [[ "$ts_ip" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+              break
+            fi
+            ts_ip=""
+            sleep 3
+          done
 
-          # Re-create the runtime directory defensively before starting sshd.
-          sudo install -d -o root -g root -m 755 /run/sshd
+          if [[ -z "$ts_ip" ]]; then
+            echo "Tailscale did not assign an IPv4 address." >&2
+            tailscale status || true
+            exit 1
+          fi
 
-          # Bind sshd to the Tailscale IPv4 only; it will not listen on public interfaces.
-          echo "ListenAddress $TS_IP" | sudo tee -a /etc/ssh/sshd_config.d/99-tailscale-ssh.conf >/dev/null
+          echo "ListenAddress $ts_ip" \
+            | sudo tee -a /etc/ssh/sshd_config.d/99-remote-tailscale.conf >/dev/null
+
+          sudo install -d -o root -g root -m 0755 /run/sshd
           sudo /usr/sbin/sshd -t
-          sudo systemctl enable --now ssh
-          sudo systemctl restart ssh
-          sudo systemctl --no-pager --full status ssh
 
-          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "### SSH access is ready" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Host: \`$TS_IP\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Port: \`22\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- User: \`remote\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Authentication: SSH public key only" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Python environment: \`/home/remote/venv\`" >> "$GITHUB_STEP_SUMMARY"
+          # Disable socket activation so sshd listens only on the Tailscale IP.
+          sudo systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+          sudo systemctl enable ssh.service
+          sudo systemctl restart ssh.service
 
-          echo "Tailscale IPv4: $TS_IP"
-          echo "Connect from Termux or your laptop with:"
-          echo "ssh -i ~/.ssh/id_ed25519 remote@$TS_IP"
-          echo
-          echo "SSH listener:"
-          sudo ss -lntp | grep -F "$TS_IP:22" || { echo "::error::SSH is not listening on the Tailscale IP"; exit 1; }
-          echo
+          listening=false
+          for attempt in $(seq 1 20); do
+            if sudo ss -lntp | grep -Fq "${ts_ip}:22"; then
+              listening=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$listening" != true ]]; then
+            echo "SSH is not listening on ${ts_ip}:22" >&2
+            sudo systemctl status ssh.service --no-pager || true
+            sudo journalctl -u ssh.service -n 60 --no-pager || true
+            exit 1
+          fi
+
+          # Repeat the root test immediately before publishing the connection details.
+          root_uid="$(sudo -u remote -H sudo -n -- /usr/bin/id -u)"
+          [[ "$root_uid" == "0" ]]
+          sudo ss -lntp | grep -F "${ts_ip}:22"
+
+          echo "TAILSCALE_IP=$ts_ip" >> "$GITHUB_ENV"
+          {
+            echo "### Ubuntu SSH is ready"
+            echo "- Address: \\`$ts_ip\\`"
+            echo "- SSH user: \\`remote\\`"
+            echo "- Port: \\`22\\`"
+            echo "- Root: \\`sudo -i\\` (passwordless; verified UID 0)"
+            echo "- Python venv: \\`/home/remote/workspace/.venv\\`"
+            echo "- FFmpeg: installed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "SSH command: ssh -i ~/.ssh/id_ed25519 remote@${ts_ip}"
+          echo "After login, run: sudo -i"
+          echo "Root access verification: PASS (UID ${root_uid})"
           tailscale status
 
-      - name: Keep the temporary SSH environment available
+      - name: Keep temporary SSH environment available
         shell: bash
         run: |
           set -euo pipefail
           echo "SSH remains available while this GitHub Actions job is running."
           while true; do
-            echo "[$(date -Is)] SSH: remote@${TAILSCALE_IP}:22"
+            echo "[$(date -Is)] SSH active: remote@${TAILSCALE_IP}:22"
             sleep 300
           done
