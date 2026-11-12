@@ -1,60 +1,147 @@
-name: Linux-ARM-Test-Lab
 
-on: 
-  workflow_dispatch: # Allows you to start it manually
+name: Ubuntu Tailscale SSH
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    # Public repos get 4 vCPU / 16GB RAM on this label
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 3600 # Runner stays alive for up to 6 hours
+  ubuntu-ssh:
+    name: Temporary Ubuntu 24.04 SSH environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Auto-Setup GUI and RDP
+      - name: Validate required secrets
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        shell: bash
         run: |
+          set -euo pipefail
+          [[ -n "${SSH_PUBLIC_KEY:-}" ]]
+          [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/ssh_authorized_key.pub"
+          ssh-keygen -lf "$RUNNER_TEMP/ssh_authorized_key.pub"
+
+      - name: Install OpenSSH, Python and tools
+        shell: bash
+        run: |
+          set -euo pipefail
           sudo apt-get update
-          # Install XFCE (Fast & Lightweight) and XRDP
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp
-          # Set XFCE as the default session
-          echo "xfce4-session" > ~/.xsession
-          sudo systemctl enable xrdp
-          sudo systemctl start xrdp
-          # Fix for Ubuntu internal permissions
-          sudo adduser xrdp ssl-cert
+          sudo apt-get install -y --no-install-recommends \
+            openssh-server \
+            python3 python3-pip python3-venv python3-dev \
+            build-essential \
+            git curl wget jq unzip zip tmux htop \
+            net-tools dnsutils ca-certificates
 
-      - name: Create Test User
+          sudo ssh-keygen -A
+          sudo systemctl stop ssh || true
+          sudo systemctl disable ssh || true
+
+      - name: Create SSH account and Python environment
+        shell: bash
         run: |
-          # Generate a random password for security
-          UPASS=$(openssl rand -base64 12)
-          sudo useradd -m -s /bin/bash tester
-          echo "tester:$UPASS" | sudo chpasswd
-          sudo usermod -aG sudo tester
-          echo "USER_PASS=$UPASS" >> $GITHUB_ENV
+          set -euo pipefail
+
+          sudo useradd --create-home --shell /bin/bash remote
+          sudo install -d -m 700 -o remote -g remote /home/remote/.ssh
+          sudo install -o remote -g remote -m 600 /dev/null \
+            /home/remote/.ssh/authorized_keys
+
+          while IFS= read -r key || [[ -n "$key" ]]; do
+            [[ -z "$key" ]] && continue
+            printf 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s\n' "$key" \
+              | sudo tee -a /home/remote/.ssh/authorized_keys >/dev/null
+          done < "$RUNNER_TEMP/ssh_authorized_key.pub"
+
+          sudo -u remote -H python3 -m venv /home/remote/venv
+
+          sudo -u remote -H /home/remote/venv/bin/python \
+            -m pip install --upgrade pip wheel setuptools
+
+          sudo -u remote -H /home/remote/venv/bin/python \
+            -m pip install requests httpx rich psutil python-dotenv ipython
+
+          sudo -u remote -H mkdir -p /home/remote/workspace
+
+          sudo -u remote -H bash -c \
+            'echo "source ~/venv/bin/activate" >> ~/.bashrc'
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo install -d -m 755 /etc/ssh/sshd_config.d
+
+          sudo tee /etc/ssh/sshd_config.d/99-tailscale-ssh.conf >/dev/null <<'EOF'
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          PermitEmptyPasswords no
+          AuthenticationMethods publickey
+          AllowUsers remote
+          X11Forwarding no
+          AllowAgentForwarding no
+          AllowTcpForwarding no
+          PermitTunnel no
+          GatewayPorts no
+          MaxAuthTries 3
+          LoginGraceTime 30
+          ClientAliveInterval 60
+          ClientAliveCountMax 3
+          EOF
+
+          sudo /usr/sbin/sshd -t
 
       - name: Connect Tailscale
-        env:
-          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ env.TS_KEY }} --hostname=gh-linux-arm
-          # Find the Tailscale IP
-          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: gh-ubuntu-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Display Connection Info
+      - name: Start SSH on Tailscale IP
+        id: connection
+        shell: bash
         run: |
-          echo "--------------------------------------------------"
-          echo "SERVER READY!"
-          echo "Tailscale IP: ${{ env.TS_IP }}"
-          echo "Username:     tester"
-          echo "Password:     ${{ env.USER_PASS }}"
-          echo "--------------------------------------------------"
-          echo "Use any RDP client (like Windows Remote Desktop) to connect."
-          
-          # Keeps the session alive
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          [[ "$TS_IP" =~ ^100\. ]] || exit 1
+
+          echo "ListenAddress $TS_IP" | sudo tee -a \
+            /etc/ssh/sshd_config.d/99-tailscale-ssh.conf
+
+          sudo /usr/sbin/sshd -t
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          echo "### SSH ACCESS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- IP: $TS_IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Port: 22" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Username: remote" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Tailscale IP: $TS_IP"
+          echo "SSH command:"
+          echo "ssh -i ~/.ssh/id_ed25519 remote@$TS_IP"
+
+          sudo ss -lntp | grep -F "$TS_IP:22"
+          tailscale status
+
+      - name: Keep SSH available
+        shell: bash
+        run: |
+          set -euo pipefail
+
           while true; do
-            echo "Keep-alive: $(date)"
+            echo "[$(date -Is)] SSH active: remote@$TAILSCALE_IP"
             sleep 300
           done
